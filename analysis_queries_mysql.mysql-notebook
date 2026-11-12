@@ -1,0 +1,348 @@
+{
+    "type": "MySQLNotebook",
+    "version": "1.0",
+    "caption": "DB Notebook 3",
+    "content": "\\about\nSELECT\n    COUNT(*)                                  AS total_visits,\n    COUNT(DISTINCT patient_nbr)               AS unique_patients,\n    SUM(readmitted_30d)                       AS readmissions_30d,\n    ROUND(100 * AVG(readmitted_30d), 2)       AS readmit_rate_pct,\n    ROUND(AVG(time_in_hospital), 2)           AS avg_length_of_stay,\n    SUM(readmitted_30d) * 15200               AS est_cost_usd\nFROM encounters;\n\nWITH baseline AS (\n    SELECT AVG(readmitted_30d) AS overall_rate\n    FROM encounters\n)\nSELECT\n    e.discharge_group,\n    COUNT(*)                                               AS visits,\n    ROUND(100 * AVG(e.readmitted_30d), 2)                  AS readmit_rate_pct,\n    ROUND(AVG(e.readmitted_30d) / MAX(b.overall_rate), 2)  AS lift_vs_average\nFROM encounters e\nCROSS JOIN baseline b\nGROUP BY e.discharge_group\nHAVING COUNT(*) >= 100\nORDER BY lift_vs_average DESC;\n\nSELECT\n    prior_inpatient_band,\n    COUNT(*)                                                              AS visits,\n    ROUND(100 * COUNT(*) / SUM(COUNT(*)) OVER (), 2)                      AS pct_of_visits,\n    SUM(readmitted_30d)                                                   AS readmissions,\n    ROUND(100 * SUM(readmitted_30d) / SUM(SUM(readmitted_30d)) OVER (), 2) AS pct_of_readmissions,\n    ROUND(100 * AVG(readmitted_30d), 2)                                   AS readmit_rate_pct\nFROM encounters\nGROUP BY prior_inpatient_band\nORDER BY prior_inpatient_band;\n\nWITH patient_visits AS (\n    SELECT\n        patient_nbr,\n        readmitted_30d,\n        COUNT(*) OVER (PARTITION BY patient_nbr) AS visits_per_patient\n    FROM encounters\n)\nSELECT\n    CASE WHEN visits_per_patient >= 3 THEN '3+ visits'\n         WHEN visits_per_patient = 2  THEN '2 visits'\n         ELSE '1 visit' END                                          AS patient_segment,\n    COUNT(DISTINCT patient_nbr)                                      AS patients,\n    SUM(readmitted_30d)                                              AS readmissions,\n    ROUND(100 * COUNT(DISTINCT patient_nbr) /\n          (SELECT COUNT(DISTINCT patient_nbr) FROM encounters), 2)   AS pct_of_patients,\n    ROUND(100 * SUM(readmitted_30d) /\n          (SELECT SUM(readmitted_30d) FROM encounters), 2)           AS pct_of_readmissions\nFROM patient_visits\nGROUP BY patient_segment\nORDER BY patient_segment;\n\n-- Q5. Does readmission risk grow with each return visit? (LAG)\nWITH ordered AS (\n    SELECT\n        encounter_seq,\n        readmitted_30d,\n        LAG(readmitted_30d) OVER (PARTITION BY patient_nbr ORDER BY encounter_id) AS prev_readmitted\n    FROM encounters\n)\nSELECT\n    CASE WHEN encounter_seq >= 4 THEN '4+' ELSE CAST(encounter_seq AS CHAR) END AS visit_number,\n    CASE WHEN prev_readmitted IS NULL THEN 'First visit'\n         WHEN prev_readmitted = 1     THEN 'Previous visit: readmitted'\n         ELSE 'Previous visit: not readmitted' END                           AS previous_visit,\n    COUNT(*)                                AS visits,\n    ROUND(100 * AVG(readmitted_30d), 2)     AS readmit_rate_pct\nFROM ordered\nGROUP BY visit_number, previous_visit\nORDER BY visit_number, previous_visit;\n\n-- Q6. Rank primary diagnoses by readmission risk (RANK)\nSELECT\n    primary_diagnosis,\n    COUNT(*)                                AS visits,\n    ROUND(100 * AVG(readmitted_30d), 2)     AS readmit_rate_pct,\n    ROUND(AVG(time_in_hospital), 2)         AS avg_stay_days,\n    RANK() OVER (ORDER BY AVG(readmitted_30d) DESC) AS risk_rank\nFROM encounters\nGROUP BY primary_diagnosis\nHAVING COUNT(*) >= 100\nORDER BY risk_rank;\n\n-- Q7. Pivot: readmission rate by age group and prior admissions (CASE WHEN pivot)\nSELECT\n    CASE WHEN age_years < 50 THEN '<50'\n         WHEN age_years < 70 THEN '50-69'\n         ELSE '70+' END                                                                    AS age_group,\n    ROUND(100 * AVG(CASE WHEN prior_inpatient_band = '0'  THEN readmitted_30d END), 2)    AS prior_0_pct,\n    ROUND(100 * AVG(CASE WHEN prior_inpatient_band = '1'  THEN readmitted_30d END), 2)    AS prior_1_pct,\n    ROUND(100 * AVG(CASE WHEN prior_inpatient_band = '2'  THEN readmitted_30d END), 2)    AS prior_2_pct,\n    ROUND(100 * AVG(CASE WHEN prior_inpatient_band = '3+' THEN readmitted_30d END), 2)    AS prior_3plus_pct,\n    COUNT(*)                                                                               AS visits\nFROM encounters\nGROUP BY age_group\nORDER BY MIN(age_years);\n\n-- Q8. HbA1c testing and treatment vs readmission\nSELECT\n    hba1c_management,\n    COUNT(*)                                            AS visits,\n    ROUND(100 * COUNT(*) / SUM(COUNT(*)) OVER (), 2)    AS pct_of_visits,\n    ROUND(100 * AVG(readmitted_30d), 2)                 AS readmit_rate_pct\nFROM encounters\nGROUP BY hba1c_management\nORDER BY hba1c_management;\n\n-- Q9. Rule-based high-risk segment: 2+ prior admissions OR discharged to nursing/rehab\nWITH flagged AS (\n    SELECT\n        readmitted_30d,\n        CASE WHEN number_inpatient >= 2\n               OR discharge_group IN ('Skilled nursing facility', 'Rehab / long-term care')\n             THEN 1 ELSE 0 END AS high_risk_rule\n    FROM encounters\n)\nSELECT\n    CASE WHEN high_risk_rule = 1 THEN 'Flagged high risk' ELSE 'Not flagged' END   AS segment,\n    COUNT(*)                                                                        AS visits,\n    ROUND(100 * COUNT(*) / SUM(COUNT(*)) OVER (), 2)                                AS pct_of_visits,\n    ROUND(100 * SUM(readmitted_30d) / SUM(SUM(readmitted_30d)) OVER (), 2)          AS pct_of_readmissions,\n    ROUND(100 * AVG(readmitted_30d), 2)                                             AS readmit_rate_pct\nFROM flagged\nGROUP BY segment\nORDER BY segment;\n\n",
+    "options": {
+        "tabSize": 4,
+        "insertSpaces": true,
+        "indentSize": 4,
+        "defaultEOL": "CRLF",
+        "trimAutoWhitespace": true
+    },
+    "viewState": {
+        "cursorState": [
+            {
+                "inSelectionMode": false,
+                "selectionStart": {
+                    "lineNumber": 131,
+                    "column": 1
+                },
+                "position": {
+                    "lineNumber": 131,
+                    "column": 1
+                }
+            }
+        ],
+        "viewState": {
+            "scrollLeft": 0,
+            "firstPosition": {
+                "lineNumber": 2,
+                "column": 1
+            },
+            "firstPositionDeltaTop": -17
+        },
+        "contributionsState": {
+            "editor.contrib.folding": {},
+            "editor.contrib.wordHighlighter": false
+        }
+    },
+    "contexts": [
+        {
+            "state": {
+                "start": 1,
+                "end": 1,
+                "language": "mysql",
+                "result": {
+                    "type": "text",
+                    "text": [
+                        {
+                            "type": 2,
+                            "content": "Welcome to the DB Notebook.\n\nUse DB Notebooks to explore MySQL data with executable SQL, JavaScript, and TypeScript code blocks.\n\n* Press Ctrl+Enter to execute or re-execute the selected code block.\n* Use Up and Down keys to move between code blocks.\n* Use Ctrl+Up and Ctrl+Down to navigate through the command history.\n\n* Execute \\sql to switch to SQL, \\js to JavaScript and \\ts to TypeScript mode.\n* Execute \\help or \\? for help;",
+                            "language": "ansi"
+                        }
+                    ]
+                },
+                "currentHeight": 192,
+                "currentSet": 1,
+                "statements": [
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 0,
+                            "length": 6
+                        },
+                        "contentStart": 0,
+                        "state": 0
+                    }
+                ]
+            },
+            "data": []
+        },
+        {
+            "state": {
+                "start": 2,
+                "end": 130,
+                "language": "mysql",
+                "result": {
+                    "type": "resultIds",
+                    "list": [
+                        "094e77e1-82f9-4a78-bbe9-9b59cd3aeeed"
+                    ]
+                },
+                "currentHeight": 352,
+                "currentSet": 1,
+                "statements": [
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 0,
+                            "length": 417
+                        },
+                        "contentStart": 0,
+                        "state": 0
+                    },
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 417,
+                            "length": 468
+                        },
+                        "contentStart": 419,
+                        "state": 0
+                    },
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 885,
+                            "length": 572
+                        },
+                        "contentStart": 887,
+                        "state": 0
+                    },
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 1457,
+                            "length": 884
+                        },
+                        "contentStart": 1459,
+                        "state": 0
+                    },
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 2341,
+                            "length": 802
+                        },
+                        "contentStart": 2407,
+                        "state": 0
+                    },
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 3143,
+                            "length": 421
+                        },
+                        "contentStart": 3202,
+                        "state": 0
+                    },
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 3564,
+                            "length": 867
+                        },
+                        "contentStart": 3649,
+                        "state": 0
+                    },
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 4431,
+                            "length": 366
+                        },
+                        "contentStart": 4483,
+                        "state": 0
+                    },
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 4797,
+                            "length": 904
+                        },
+                        "contentStart": 4887,
+                        "state": 0
+                    }
+                ]
+            },
+            "data": [
+                {
+                    "tabId": "8c32b1ca-1533-4e95-838d-4e0dc3b5c208",
+                    "resultId": "094e77e1-82f9-4a78-bbe9-9b59cd3aeeed",
+                    "rows": [
+                        {
+                            "0": "Flagged high risk",
+                            "1": 28410,
+                            "2": "28.60",
+                            "3": "46.12",
+                            "4": "18.37"
+                        },
+                        {
+                            "0": "Not flagged",
+                            "1": 70930,
+                            "2": "71.40",
+                            "3": "53.88",
+                            "4": "8.59"
+                        }
+                    ],
+                    "columns": [
+                        {
+                            "title": "segment",
+                            "field": "0",
+                            "dataType": {
+                                "type": 17,
+                                "characterMaximumLength": 65535,
+                                "flags": [
+                                    "BINARY",
+                                    "ASCII",
+                                    "UNICODE"
+                                ],
+                                "needsQuotes": true,
+                                "parameterFormatType": "OneOrZero"
+                            },
+                            "inPK": false,
+                            "nullable": false,
+                            "autoIncrement": false
+                        },
+                        {
+                            "title": "visits",
+                            "field": "1",
+                            "dataType": {
+                                "type": 4,
+                                "flags": [
+                                    "SIGNED",
+                                    "ZEROFILL"
+                                ],
+                                "numericPrecision": 10,
+                                "parameterFormatType": "OneOrZero",
+                                "synonyms": [
+                                    "INTEGER",
+                                    "INT4"
+                                ]
+                            },
+                            "inPK": false,
+                            "nullable": false,
+                            "autoIncrement": false
+                        },
+                        {
+                            "title": "pct_of_visits",
+                            "field": "2",
+                            "dataType": {
+                                "type": 10,
+                                "flags": [
+                                    "UNSIGNED",
+                                    "ZEROFILL"
+                                ],
+                                "numericPrecision": 65,
+                                "numericScale": 30,
+                                "parameterFormatType": "TwoOrOneOrZero",
+                                "synonyms": [
+                                    "FIXED",
+                                    "NUMERIC",
+                                    "DEC"
+                                ]
+                            },
+                            "inPK": false,
+                            "nullable": false,
+                            "autoIncrement": false
+                        },
+                        {
+                            "title": "pct_of_readmissions",
+                            "field": "3",
+                            "dataType": {
+                                "type": 10,
+                                "flags": [
+                                    "UNSIGNED",
+                                    "ZEROFILL"
+                                ],
+                                "numericPrecision": 65,
+                                "numericScale": 30,
+                                "parameterFormatType": "TwoOrOneOrZero",
+                                "synonyms": [
+                                    "FIXED",
+                                    "NUMERIC",
+                                    "DEC"
+                                ]
+                            },
+                            "inPK": false,
+                            "nullable": false,
+                            "autoIncrement": false
+                        },
+                        {
+                            "title": "readmit_rate_pct",
+                            "field": "4",
+                            "dataType": {
+                                "type": 10,
+                                "flags": [
+                                    "UNSIGNED",
+                                    "ZEROFILL"
+                                ],
+                                "numericPrecision": 65,
+                                "numericScale": 30,
+                                "parameterFormatType": "TwoOrOneOrZero",
+                                "synonyms": [
+                                    "FIXED",
+                                    "NUMERIC",
+                                    "DEC"
+                                ]
+                            },
+                            "inPK": false,
+                            "nullable": false,
+                            "autoIncrement": false
+                        }
+                    ],
+                    "executionInfo": {
+                        "text": "OK, 2 records retrieved in 168.63ms"
+                    },
+                    "totalRowCount": 2,
+                    "hasMoreRows": false,
+                    "currentPage": 0,
+                    "index": 8,
+                    "sql": "\n\n-- Q9. Rule-based high-risk segment: 2+ prior admissions OR discharged to nursing/rehab\nWITH flagged AS (\n    SELECT\n        readmitted_30d,\n        CASE WHEN number_inpatient >= 2\n               OR discharge_group IN ('Skilled nursing facility', 'Rehab / long-term care')\n             THEN 1 ELSE 0 END AS high_risk_rule\n    FROM encounters\n)\nSELECT\n    CASE WHEN high_risk_rule = 1 THEN 'Flagged high risk' ELSE 'Not flagged' END   AS segment,\n    COUNT(*)                                                                        AS visits,\n    ROUND(100 * COUNT(*) / SUM(COUNT(*)) OVER (), 2)                                AS pct_of_visits,\n    ROUND(100 * SUM(readmitted_30d) / SUM(SUM(readmitted_30d)) OVER (), 2)          AS pct_of_readmissions,\n    ROUND(100 * AVG(readmitted_30d), 2)                                             AS readmit_rate_pct\nFROM flagged\nGROUP BY segment\nORDER BY segment;",
+                    "updatable": false
+                }
+            ]
+        },
+        {
+            "state": {
+                "start": 131,
+                "end": 131,
+                "language": "mysql",
+                "currentSet": 1,
+                "statements": [
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 0,
+                            "length": 0
+                        },
+                        "contentStart": 0,
+                        "state": 0
+                    }
+                ]
+            },
+            "data": []
+        },
+        {
+            "state": {
+                "start": 132,
+                "end": 132,
+                "language": "mysql",
+                "currentSet": 1,
+                "statements": [
+                    {
+                        "delimiter": ";",
+                        "span": {
+                            "start": 0,
+                            "length": 0
+                        },
+                        "contentStart": 0,
+                        "state": 0
+                    }
+                ]
+            },
+            "data": []
+        }
+    ]
+}
